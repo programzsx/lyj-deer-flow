@@ -1,84 +1,184 @@
-# TypeSafeSignalClassifier档案
+# TypeSafeSignalClassifier-档案
 
 ## 一、这个类是干什么的
 
-这个类是TypeSafe信号分类器。
+TypeSafeSignalClassifier是agents/memory/signals/typesafe.py里的类。
 
-这个类的作用是把一批对话的认可和拒绝概率转成提示标签。
+它是TypeSafe信号分类器。
 
-这个类回答的问题是"这批对话是否明确认可或拒绝了用户之前的偏好"。
+每批两个noul问题。只做增量提示。
+
+它把批文本的affirmation和negation概率变成提示标签。
+
+两个独立问题如下。
+
+文本是否显式背书之前声明的用户级偏好、约束、方法。
+
+文本是否显式拒绝或反转之前声明的用户级偏好、约束、方法。
+
+映射到确定性标签reinforcement和correction。
+
+这个侧只做增量。
+
+模型verdict可以加提示文本。
+
+在预筛选enforce乘classifier hints下可以否决skip。
+
+它自己永不决定提取。
+
+永不驱动删除。
+
+永不参与强化证据门。
 
 这个类位于backend/packages/harness/deerflow/agents/memory/signals/typesafe.py。
 
-源文件的模块说明说，这个类是TypeSafe（Jev）信号分类器。这个类对每一批对话问两个独立的问题。第一个问题是文本是否**明确认可**了用户之前说过的偏好、约束或做法。第二个问题是文本是否**明确拒绝或反转**了用户之前说过的偏好、约束或做法。两个问题的答案映射成`reinforcement`和`correction`标签。
-
-这个类拥有的东西包括下面这些。两个问题和它们的评分标准。`hint_threshold`阈值。标签映射规则。自己的以`digest`为键的缓存。被询问模型版本的审计策略。
-
-这个类永远不决定抽取。永远不驱动删除。这两条是模块说明里写死的约束。
-
-`mode`参数被记录用于策略身份。`mode`参数不改变这个类的行为。模式决定标签是被消费、只记录、还是被忽略。这是设计文档§2.2.4的内容。
-
-这个类实现了MemorySignalProvider协议。这个类也符合CombinableClassifier协议。协调器能把它当分类侧用，也能在合并模式下让它带请求。
-
 ## 二、类的成员（字段、方法，各自做什么）
 
-这个类有三个类属性、一组实例配置和一组方法。
+### 1、构造方法
 
-### 1、类属性
+mode必须在MODES里。默认shadow。
 
-- `name`：值为`typesafe`。这是提供方名字。审计和失败日志用这个名字。
-- `policy_id`：值为`deerflow.memory.signals.typesafe`。这是策略身份。
-- `policy_version`：值为`1.0.0`。这是策略版本号。
+resolve_connection解析TypeSafe连接。
 
-### 2、构造方法
+hint_threshold默认0.5。必须在0到1。
 
-- `__init__`方法：输入是关键字参数。`mode`是模式，默认`shadow`。`api_key`和`api_key_env`是凭据。`base_url`和`model`是连接信息。`hint_threshold`是标签阈值，默认0.5。`instructions`和`criteria`是问题文本的覆盖项。`max_state_chars`是文本长度上限，默认6000。`timeout`、`deadline_seconds`、`max_attempts`、`retry_backoff`是传输配置。`cache_size`和`cache_ttl_seconds`是缓存配置。`transport_factory`是传输工厂。
+max_state_chars默认6000。
 
-  构造时做下面几件事。先校验`mode`合法性。再解析连接配置。再建TypeSafeClient。再校验阈值范围。再组装两个问题的文本。问题文本的来源有三个，配置覆盖、用户instructions、内置默认。再校验长度和缓存参数。再建自己的AnswerCache。
+cache_size默认256。cache_ttl_seconds默认300秒。
 
-### 3、侧接口方法
+两个问题如下。
 
-- `questions`方法：无输入。返回问题映射。这个类有两个问题。问题类型是`noul`。每个问题带instructions和true/false评分标准。
-- `ask`方法：输入是批次文本和问题映射。返回AnswerSet。这个方法拿文本的会话尾部状态发请求。
-- `sharing_key`方法：输入是任意关键字参数。返回字符串。这是内部共享身份。包括凭据指纹、连接、限制和缓存。
-- `interpret`方法：输入是答案映射，加`model`和`cached`关键字参数。返回MemorySignalDecision或None。这个方法把验证过的答案转成标签。认可答案有概率时，进`reinforcement`标签。拒绝答案有概率时，进`correction`标签。两个方向都没验证出来时，返回None。一个方向失败，另一个方向照样进结论。
+QUESTION_AFFIRMATION是signal_affirmation。
 
-### 4、身份方法
+QUESTION_NEGATION是signal_negation。
 
-- `release_policy_parameters`方法：无输入。返回字典。声明影响行为的参数。包括模式、连接参数、阈值、两侧问题文本的哈希和评分标准、长度和缓存配置。凭据永远不进这个字典。
+都是noul类型。
 
-### 5、契约入口方法
+affirmation的true criteria是显式背书用户之前要求的东西。
 
-- `decide`方法：输入是MemorySignalRequest。返回MemorySignalDecision或None。这是单侧路径的入口。先拿`digest`查缓存。答案齐全时直接解释缓存答案，标记为缓存命中。答案不齐时，发请求拿缺的方向。拿到验证过的答案后写回缓存，结论报告本次服务的模型，标记为非缓存。请求级失败抛TypeSafeError，让协调器记录`request_failed`。调用方退回确定性信号。
+false是只批准当前任务、结果或文件不算。
+
+negation的true是显式拒绝或反转用户之前要求的东西。
+
+false是对当前任务的批评不算。
+
+### 2、mode的语义
+
+mode记录进策略身份。但不改这个类的行为。
+
+mode决定labels是被消费、只记录、还是忽略。
+
+### 3、interpret方法
+
+它把验证答案映射成提示标签。
+
+没有方向可用时返回None。
+
+一个方向没有验证答案时它不贡献。
+
+同一响应的另一个方向仍被使用。
+
+按问题计数。不是按侧。这是S7和S18。
+
+direction_labels的映射固定。
+
+affirmation达到hint_threshold是reinforcement。
+
+negation达到threshold是correction。
+
+两者可以同时成立。
+
+保留用X。但停止用Y。
+
+### 4、decide方法
+
+decide是独立入口。单侧路径。
+
+桶按问题。永不按侧。
+
+持有一个方向不算完全命中。
+
+本轮发送缺失方向。答案合并进同一个桶。
+
+整个请求失败时本轮无结果。
+
+有验证答案到达时verdict含网络样本。
+
+报告服务的模型。
+
+没有新验证时verdict靠桶已持有的答案。
+
+重试返回无效答案时它没提供被消费的证据。
+
+### 5、release_policy_parameters
+
+声明影响行为的参数。
+
+永远不含密钥。
+
+包括mode、连接参数、hint_threshold、两问题的instructions哈希和criteria、缓存参数。
+
+### 6、signals/contract.py
+
+contract.py定义增量信号分类契约。
+
+MemorySignalRequest和预筛选同一数据面。
+
+MemorySignalDecision是hint标签。
+
+probabilities只携带产生了验证答案的方向。
+
+一个可用方向仍贡献它。
+
+失败按问题计数。不按侧。
+
+MemorySignalProvider是duck-typed Protocol。
+
+None是没有模型结果。确定性信号stand。
+
+请求级失败传播TypeSafeError。
+
+resolve_memory_signal_classifier和预筛选的resolver规则相同。
+
+off时不解析不验证。
+
+其他mode fail loudly。
+
+### 7、_QuestionText和辅助函数
+
+_QuestionText是一个问题的可配置文本。slots优化。
+
+_instructions按问题id或方向名查覆盖。
+
+_side_criteria验证criteria映射结构。
 
 ## 三、它和谁协作
 
-这个类由解析函数生产。
-
-`resolve_memory_signal_classifier`函数按配置加载这个类。配置的`use`字段写类路径。`build_memory_judge`函数调用解析函数。解析出来的实例交给MemorySignalCoordinator。
-
-这个类由协调器消费。
-
-协调器把它当MemorySignalProvider用。协调器调用`decide`发单侧请求。协调器也把它当CombinableClassifier用。合并模式下，协调器调用`questions`、`ask`和`interpret`。
-
-上游依赖。这个类依赖judging模块的AnswerCache、CachedVerdict、conversation_tail_state。依赖contract.py的标签常量、模式常量、MemorySignalDecision、direction_labels。依赖typesafe包的TypeSafeClient、TypeSafeConnection、Question、Answer。依赖deerflow_extension_api的canonical_hash。
-
-组合关系。这个类内部持有TypeSafeClient和TypeSafeConnection。内部持有两个_QuestionText对象。内部持有自己的AnswerCache。
-
-配置热重载。这个类实现的连接身份是热重载失效签名的一部分。凭据轮换会让判官失效重建。
+- TypeSafeClient是共享传输客户端。
+- AnswerCache是digest键缓存。
+- MemorySignalCoordinator在双侧启用时组合请求。
+- DeerMem updater消费labels。
 
 ## 四、重要性评级
 
-这个类的评级是6分。
+评级是5分。
 
 理由如下。
 
-这个类是信号分类侧的默认实现。协议是抽象的形状。这个类是真正干活的实体。模型请求由它发。标签由它映射。缓存由它维护。
+这个类是内存信号分类的实现。
 
-这个类承载了标签映射的质量。两个问题的措辞和评分标准决定分类的准确性。设计文档说，`hints`模式的上线需要独立的人工评审数据集。这个类的问题文本就是评审对象。
+增量语义清晰。永不决定提取。
 
-删掉这个类，信号分类退回纯确定性规则。配置解析找不到实现，会大声报错。整个分类侧没有模型参与。
+两个问题独立。失败按问题计数。
 
-这个类的依赖面集中在judging体系内部。协调器通过协议使用它。外部代码不直接触碰它。
+桶按问题不按侧。缺失方向补问。
 
-评级给6分。这个类是功能的实际提供者，但它是可选特性的一部分。两侧都关闭时，这个类不会被构造。
+标签映射固定。两方向可同时成立。
+
+release参数不含密钥。
+
+这些质量不错。
+
+扣掉5分。
+
+扣分原因是它是可选shadow功能的分类器。

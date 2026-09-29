@@ -1,136 +1,108 @@
-# CheckpointStateAccessor档案
-
-源码位置：`backend/packages/harness/deerflow/runtime/checkpoint_state.py`
+# CheckpointStateAccessor-档案
 
 ## 一、这个类是干什么的
 
-这个类是检查点状态访问器。
+CheckpointStateAccessor是runtime/checkpoint_state.py里的类。
 
-这个类是线程检查点状态读写的唯一咽喉点。
+它是线程checkpoint状态读取和写入的唯一咽喉点。
 
-这个类把三样东西绑在一起。
+它绑定一个编译好的图（携带模式匹配的channel schema）、一个checkpointer和冻结的channel模式。
 
-第一样，编译好的图。图带着模式匹配的通道schema。
-
-第二样，checkpointer。检查点的存储后端。
-
-第三样，冻结的通道模式。full或delta。
-
-每次操作都做两件事。
-
-第一件，把模式标记注入config。
-
-第二件，过兼容性门。
+每个操作把模式标记注入config并通过兼容门。
 
 然后才碰状态。
 
-delta检查点不存完整的channel_values。
+Delta checkpoint不存完整的channel_values。
 
-直接调checkpointer的原始读取只能看到哨兵。
+原始saver读看到的是哨兵。
 
 所以消费方必须经过这个访问器。
 
-不能直接调checkpointer。
+而不是直接调用checkpointer。
 
-这是强制约定。
+这个类位于backend/packages/harness/deerflow/runtime/checkpoint_state.py。
 
-run rollback、上下文压缩、线程状态读写。
+## 二、类的成员（字段、方法，各自做什么）
 
-全部走这个访问器。
+### 1、CheckpointStateAccessor
 
-这个模块还有一个独立函数`build_state_mutation_graph`。
+它bind静态方法绑定图、checkpointer和模式。
 
-这个函数编译一个纯状态图。
+所有操作都注入模式标记并通过兼容门。
 
-图里只有一个空节点。
+delta模式下原始saver读看到哨兵。
 
-入口即终点。
+这是消费方必须用它而不是直接调checkpointer的原因。
 
-这个图用于整体状态替换。
+### 2、build_state_mutation_graph函数
 
-比如回滚恢复和上下文压缩。
+这个函数编译一个状态专用的图。
 
-它和agent图共享检查点机制。
+单节点。一个no-op节点。入口等于finish。
 
-但不调度任何待执行节点。
+用于整体状态替换。
 
-写入的头部保持空闲。
+例如回滚恢复和上下文压缩。
 
-不会重新触发agent。
+它共享代理图的checkpoint机制。
 
-## 二、类的成员
+但调度没有pending节点。
 
-### （一）字段
+写出的head保持空闲。
 
-- `graph`：编译好的LangGraph图。带着模式匹配的通道schema。get和history实际调的是图的state读取。
-- `checkpointer`：检查点存储后端。元数据读取和写前检查直接调它。
-- `mode`：冻结的通道模式。`full`或`delta`。
+update_state要求节点注册在图里。
 
-### （二）类方法
+专用单节点图应用reducer写入并结束。
 
-- `bind`：构造绑定好的访问器。把checkpointer挂到图上。可选挂store。返回访问器实例。
+mutation checkpoint不调度代理节点。
 
-### （三）实例方法
+### 3、state_schema要求
 
-- `_prepare_config`：准备config。复制configurable和metadata。注入模式标记。每个操作都先过这里。
-- `get`：同步读取物化状态。调图的get_state。过快照兼容门。不兼容就抛`CheckpointModeMismatchError`。
-- `aget`：异步版get。
-- `get_metadata`：只读检查点元数据。不物化通道状态。调checkpointer的get_tuple。过元数据兼容门。
-- `aget_metadata`：异步版get_metadata。
-- `history`：读检查点历史。limit为0表示零条。None表示不限。每个快照都过兼容门。
-- `ahistory`：异步版history。
-- `update`：同步写状态。写前先过兼容门。写是不可撤销的。所以提前检查。
-- `aupdate`：异步版update。
+state_schema必须是线程的有效schema。
 
-### （四）模块级函数
+代理图编译用的那个类。
 
-- `build_state_mutation_graph`：编译纯状态图。一个空节点。入口即终点。用于回滚恢复和压缩。schema必须用线程的实际schema。基础ThreadState不知道中间件贡献的通道。写未知通道会被静默丢弃。
-- `graph_state_schema`：返回图编译时用的schema类。
-- `graph_writable_channels`：返回图的用户可见通道名。排除内部通道和分支通道。
-- `graph_reducer_channels`：返回走reducer合并的通道名。这些通道的替换写入要包`Overwrite`。
+写携带物化状态时必须如此。
+
+基类ThreadState回退不知道自定义中间件贡献的channel。
+
+写到未知channel会被悄悄丢弃。
+
+回退按显式参数、进程冻结、配置默认解析delta快照节奏。
+
+显式state_schema已在身份里带节奏。
+
+### 4、graph_state_schema函数
+
+这个函数从图提取state schema。
 
 ## 三、它和谁协作
 
-这个类和checkpoint_mode模块协作。
-
-模式标记注入和兼容门都来自那里。
-
-`inject_checkpoint_mode`、`raise_if_snapshot_incompatible`、`ensure_checkpoint_mode_compatible`。
-
-这个类和runs worker协作。
-
-回滚流程通过访问器物化完整的运行前状态。
-
-这个类和context_compaction协作。
-
-手动压缩通过访问器读快照、写压缩后的状态。
-
-这个类和Gateway协作。
-
-访问器图的缓存按用户和快照频率管理。
-
-线程状态的元数据读取走`get_metadata`保留模式门。
-
-这个类和`build_state_mutation_graph`协作。
-
-回滚和压缩用这个函数编译的纯状态图做写入。
+- checkpoint_mode模块提供模式注入和兼容门。
+- thread_state的get_thread_state_schema提供schema。
+- 手动compaction和状态更新路由通过它写状态。
+- DeerFlowClient.get_thread用它读历史。
 
 ## 四、重要性评级
 
-评级：8分（满分10分）。
+评级是7分。
 
-理由：
+理由如下。
 
-- 这个类是检查点状态访问的唯一入口。
-- 它是模式安全和数据完整性的咽喉点。
-- delta检查点存的是哨兵。
-- 绕过它直接读checkpointer只能看到空状态。
-- 它强制每个操作都注入模式标记、过兼容门。
-- full模式进程读delta线程在这里被拦下。
-- 它保证了回滚和压缩写入用对schema。
-- 中间件贡献的通道不会被静默丢弃。
-- 没有它，检查点模式的不变量会被各处绕过。
-- 核心运行时类评7到9分。
-- 它本身是薄封装。
-- 逻辑大部分委托给图和checkpointer。
-- 评8分。
+这个类是checkpoint状态读写的唯一咽喉点。
+
+delta模式下原始saver读看到哨兵。
+
+直接调checkpointer会读到错的数据。
+
+模式注入和兼容门保证每次操作都匹配冻结模式。
+
+build_state_mutation_graph让回滚和压缩共享checkpoint机制。
+
+state_schema的要求防止未知channel写入被悄悄丢弃。
+
+这些是状态一致性的关键。
+
+扣掉3分。
+
+扣分原因是它是读写转发层。

@@ -1,67 +1,173 @@
-# MemoryUpdater档案
-
-源文件位置：backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/updater.py
+# MemoryUpdater-档案
 
 ## 一、这个类是干什么的
 
-这个类是基于LLM的记忆更新器。
+MemoryUpdater是agents/memory/backends/deermem/deermem/core/updater.py里的类。
 
-这个类负责用大语言模型从对话里提取记忆。这个类也负责记忆数据的读写和事实的增删改查。
+它用LLM基于会话上下文更新内存。
 
-这个类是DeerMem记忆后端的大脑。队列攒好一批对话后交给这个类。这个类先把对话格式化成提示词。然后调用LLM。然后解析LLM的返回。然后应用更新。最后持久化。
+它是DeerMem的提取引擎。
 
-这个类的更新是尽力而为的。失败会被吞掉。失败时水位线不推进。下一轮对话会重新喂入这批消息。
+DI注入config、storage、llm、prompts_dir、callbacks。
 
-这个类还有容量控制。事实数量超过上限时，这个类调用淘汰策略。这个类还负责确认确认机制。确定性的消息处理才能确认一条事实。
+它处理staleness审查、整合、水位、容量淘汰、scope gate。
 
-## 二、类的成员
+这个类非常大。约2600行。
 
-### （一）字段
+这个类位于backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/updater.py。
 
-- _config：DeerMem私有配置。
-- _storage：注入的存储实例。存储实例由DeerMem拥有。
-- _llm：用于记忆提取的聊天模型。模型由DeerMem拥有。没有配置LLM时为None。
-- _prompts_dir：可选的自定义提示词模板目录。
-- _callbacks：可选的MemoryCallbacks。回调在LLM调用前合并追踪元数据。
-- _watermarks：水位线缓存。水位线记录每个（thread_id，user_id，agent_name）键最后提取的消息身份。缓存是有界的LRU。缓存被丢弃的键会在该线程下一轮重新提取一批。
+## 二、类的成员（字段、方法，各自做什么）
 
-### （二）主要方法
+### 1、构造和水位
 
-- update_memory：同步更新记忆的核心入口。这个方法用同步LLM路径。同步路径用model.invoke。同步路径和主智能体的异步连接池完全隔离。这消除了跨事件循环连接复用的bug。在运行中的事件循环里调用时，这个方法把阻塞调用卸载到线程池。
-- _do_update_memory_sync：执行同步更新的内部方法。
-- _do_update_memory_sync_impl：同步更新的完整实现。实现包括提示词准备、LLM调用、结果解析、应用更新。
-- _prepare_update_prompt：准备更新的提示词。
-- _finalize_update：最终化更新。最终化包括容量控制和持久化。
-- _apply_updates：把LLM返回的更新应用到当前记忆。
-- _select_for_capacity：应用配置的淘汰策略。可选地计算hybrid影子决策。
-- _record_capacity_decision：记录容量淘汰决策。
-- _judge_batch：对批次调用注入的记忆裁判。
-- _build_signal_hints：把确定性信号转换成提示词提示。
-- _watermark_get和_watermark_set：水位线的读写。
-- _feed_after_watermark：过滤掉水位线之前的消息。
-- get_memory_data：通过存储读取当前记忆数据。
-- reload_memory_data：通过存储重新加载记忆数据。
-- import_memory_data：导入记忆数据。
-- clear_memory_data：清空指定范围的记忆数据。
-- clear_all_memory_data：清空一个用户的全部记忆。
-- create_memory_fact：创建一条事实。
-- delete_memory_fact：删除一条事实。
-- update_memory_fact：更新一条事实。
-- _emit_extraction_metrics：发出提取指标。
-- _notify_llm_result：通知LLM调用的结果。
+构造方法注入config、storage、llm。
+
+prompts_dir可选。callbacks可选。
+
+on_memory_llm_call在LLM调用前合并trace元数据。
+
+_watermarks是每(thread_id, user_id, agent_name)的已提取消息身份。
+
+有界LRU。config.watermark_max_keys。
+
+长寿命gateway处理很多线程不能无限增长。
+
+丢键时该线程下轮重新提取一批。
+
+### 2、存储访问
+
+_save_memory_to_file通过注入的storage保存。
+
+expected_revision支持乐观并发。
+
+get_memory_data和reload_memory_data通过storage。
+
+### 3、容量淘汰
+
+_select_for_capacity应用配置策略。
+
+可选计算hybrid shadow。
+
+fact_eviction_policy是hybrid-v1或shadow启用时算usage。
+
+decision和shadow_decision。
+
+_record_capacity_decision在规范持久化成功后尽力写审计。
+
+### 4、import_memory_data方法
+
+替换导入不能把畸形facts变成删除。
+
+在宽容兼容规整或任何storage读之前验证。
+
+facts必须是列表。content非空。
+
+apply_changes带upserts、deletes、revisions。
+
+manifest revision乐观并发。
+
+容量淘汰应用。
+
+### 5、staleness审查
+
+_select_stale_candidates返回超过个体审查窗口的facts。
+
+每个fact的有效审查age由expected_valid_days决定。
+
+没有时回退全局staleness_age_days。
+
+有效的lastConfirmedAt重置审查时钟。
+
+它是fact仍真的显式证据。
+
+否则createdAt是参考。
+
+保护类别排除。默认correction。
+
+它们是显式用户反馈。不应按age自动修剪。
+
+_safe_add_days处理巨大持久值的溢出。
+
+返回None让调用方回退。
+
+不中止整个更新周期。
+
+staleness_max_lifetime_multiplier cap在写时应用一次。
+
+审查窗口从一开始有界。
+
+在这里再应用会阻止寿命延长操作移动审查窗口。
+
+ defeating staleFactsToExtend的目的。
+
+### 6、staleness prompt
+
+_build_staleness_section从候选facts格式化prompt节。
+
+每个fact行带valid:Nd标注。
+
+该fact的有效审查窗口。
+
+LLM能校准它的保守性。
+
+30天后审查的fact在创建时被认为易变。
+
+365天后审查的被认为稳定。
+
+### 7、scope gate
+
+_fact_scope_gate_reason、_summary_scope_gate_reason、_removal_scope_gate_reason。
+
+规范化gate标签。
+
+scope gate防止LLM越权。
+
+### 8、响应解析
+
+_parse_memory_update_response解析LLM响应。
+
+_normalize_memory_update_data规整更新数据。
+
+_strip_upload_mentions从内存剥离上传提及。
+
+### 9、去重
+
+_fact_content_key规整内容键。
+
+_fact_content_tokens分词。
+
+_fact_content_similarity计算token-Jaccard相似度。
 
 ## 三、它和谁协作
 
-- MemoryUpdateQueue是它的上游。队列把批次交给这个类处理。
-- MemoryStorage是它的存储层。这个类通过注入拿到存储实例。这个类调用存储的load、save、apply_changes、get_fact_usage等方法。
-- select_facts_for_capacity是它的淘汰函数。这个函数来自eviction模块。
-- load_prompt和load_prompt_messages是它的提示词加载函数。这些函数来自prompt模块。
-- format_conversation_for_update是它的对话格式化函数。这个函数来自prompt模块。
-- detect_signals是它的信号检测函数。这个函数来自message_processing模块。
-- MemoryCallbacks是它的可选回调接口。
+- MemoryStorage是存储层。
+- DeerMemConfig提供配置。
+- MemoryUpdateQueue调用update_memory。
+- load_prompt加载prompt模板。
+- callbacks注入tracing。
 
 ## 四、重要性评级
 
-评级：9分。
+评级是8分。
 
-理由：这个类是记忆后端的核心更新类。记忆的提取、解析、应用、持久化全部经过这个类。这个类承载了水位线机制。水位线机制决定哪些消息被提取。这个类承载了容量控制。容量控制决定哪些事实被保留。这个类还解决了真实的跨事件循环连接复用bug。这个类出问题，记忆就不会被写入。这个类是全项目最关键的记忆组件之一。
+理由如下。
+
+MemoryUpdater是内存提取的大脑。
+
+LLM响应解析、scope gate、水位、staleness、整合、容量淘汰都在这里。
+
+巨大数值的溢出处理很细。
+
+_safe_add_days防OverflowError中止整个更新周期。
+
+保护类别不按age修剪。
+
+staleness prompt的valid:Nd标注帮LLM校准。
+
+乐观并发贯穿。
+
+这些是内存质量的核心。
+
+扣掉2分。
+
+扣分原因是它依赖LLM质量。

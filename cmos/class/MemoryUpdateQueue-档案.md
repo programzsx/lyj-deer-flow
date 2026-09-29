@@ -1,56 +1,182 @@
-# MemoryUpdateQueue档案
-
-源文件位置：backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py
+# MemoryUpdateQueue-档案
 
 ## 一、这个类是干什么的
 
-这个类是带防抖机制的记忆更新队列。
+MemoryUpdateQueue是agents/memory/backends/deermem/deermem/core/queue.py里的类。
 
-记忆更新是昂贵的。每次对话都调用一次LLM提取记忆太浪费。这个队列把对话上下文攒起来。攒到可配置的防抖时间后再统一处理。防抖窗口内收到的多个对话会被合并成一次更新。合并的键是（thread_id，user_id，agent_name）。
+它是带去抖机制的内存更新队列。
 
-这个队列是进程本地的内存列表加一个threading.Timer。进程退出时还没处理的条目会丢失。flush_sync方法能缓解这个问题。这个方法为优雅停机提供了同步排水。记忆更新是尽力而为的。失败或丢失的更新会在下一轮对话时重新喂入。中间件每轮传完整对话。更新器失败时不推进水位线。所以内存队列覆盖了现实中的优雅部署场景。这个设计不需要持久层。
+它收集会话上下文。
 
-这个队列处理背压。队列深度到达上限时拒绝新的无信号普通条目。带信号的条目和紧急刷新永远被接纳。信号承载重要记忆。紧急路径承载即将被摘要移除的消息。这两种数据丢了就是真丢。仅仅延迟不算丢。
+在配置的去抖期后处理它们。
 
-## 二、类的成员
+去抖窗口内收到的多个会话批处理在一起。
 
-### （一）字段
+QueueFull是backpressure异常。
 
-- _config：DeerMem私有配置。
-- _updater：注入的MemoryUpdater实例。
-- _items：待处理的上下文列表。
-- _lock：线程锁。
-- _timer：防抖定时器。定时器是守护线程。
-- _processing：是否正在处理。
-- _processing_thread：当前运行_process_queue的线程。空闲时为None。flush_sync会join在途的工作线程。
-- _reprocess_pending：待重新处理的标记。处理中的标记置位时，活动工作线程在finally块里检查这个标记并重跑一次。
+这个类位于backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py。
 
-### （二）主要方法
+## 二、类的成员（字段、方法，各自做什么）
 
-- add：把一个对话加入队列。加入后重置防抖定时器。
-- add_nowait：把一个对话加入队列并立即在后台开始处理。
-- _enqueue_locked：入队的核心逻辑。逻辑包括合并、背压检查、信号并集。
-- _reset_timer：重置防抖定时器。
-- _schedule_timer：按给定延迟调度队列处理。调度前取消已有定时器。
-- _process_queue：处理所有排队上下文。这个方法逐个调用更新器。更新之间有小延迟避免限流。处理中和add并发时只设置重跑标记，不生成紧定时器自旋。
-- flush：强制立即处理队列。用于测试或优雅停机。
-- flush_sync：按超时界限尽力同步刷新。这个方法先join在途的工作线程。然后在守护线程上排水并等待。返回True只表示排水真正完成。这个方法处理了两个天真的flush会漏掉的竞态。
-- flush_nowait：立即在后台线程开始处理。
-- cancel_by_agent：按范围丢弃待处理上下文，不处理。只丢弃还在_items里的上下文。已经被在途工作线程取出的上下文故意不动。
-- clear：清空队列，不处理。用于测试。
-- pending_count：获取待处理数量。
-- is_processing：检查是否正在处理。
+### 1、ConversationContext
+
+它是队列里的一个会话上下文。
+
+thread_id、messages、agent_name、user_id、trace_id、signals、bypass_watermark。
+
+user_id在入队时捕获。
+
+存在ConversationContext里。跨threading.Timer边界存活。
+
+ContextVar不跨裸线程传播。
+
+trace_id在入队时捕获。
+
+后面Timer线程把它附加到内存LLM tracing元数据。
+
+### 2、add和add_nowait
+
+add加会话进更新队列。去抖。
+
+add_nowait加会话并立即后台处理。
+
+bypass_watermark为True。
+
+匹配键包含bypass_watermark。
+
+emergency和普通更新共存。
+
+摘要flush不替换同key的pending普通更新。
+
+替换会丢掉普通更新未提取的尾部。
+
+用户停止时下轮可能不再喂。
+
+两者独立处理。
+
+### 3、backpressure
+
+队列深度达到cap时拒绝新的非信号普通条目。
+
+QueueFull。
+
+同key更新合并不增深度。
+
+带信号条目和emergency flush总是准入。
+
+信号捕获重要内存。
+
+emergency路径捕获摘要要移除的消息。
+
+两者下轮都不能重新喂。
+
+负载下丢它们是丢数据。不是延迟。
+
+### 4、信号合并
+
+按信号并集合并。
+
+任何更新见过的信号保持。
+
+### 5、_process_queue
+
+它处理队列。
+
+update_memory调用带judge参数。
+
+shutdown drain永不预筛选。design L7。
+
+它的预算属于持久化。
+
+judge请求会把有界关闭窗口的一部分花在成本优化上。
+
+不是花在保存排队工作上。
+
+条目间小延迟避免速率限制。
+
+shutdown drain路径跳过。
+
+它竞争有界超时。
+
+预算应花在LLM调用上。不是条目间睡眠。
+
+摘要计数区分drained和saved。
+
+成功加失败计数。
+
+### 6、重调度
+
+_reprocess_pending在新工作处理中到达时立即重跑。
+
+重调度在锁内。
+
+_schedule_timer读取消重赋值非原子。
+
+并发add的_reset_timer触碰同字段。
+
+持锁让重调度对add原子。
+
+_schedule_timer只调Timer.start。
+
+无同步锁获取。不会死锁。
+
+### 7、flush和flush_sync
+
+flush强制立即处理。
+
+flush_sync是有界同步flush。
+
+在daemon线程跑flush。等最多timeout秒。
+
+优雅关闭用。
+
+队列纯内存。Timer是daemon线程。
+
+不flush则重启或SIGTERM时丢更新。
+
+_flush_sync join在途worker。
+
+不报假阳性completed。
+
+已从队列拉出的上下文还在处理时。
+
+退出会丢它们。
+
+### 8、cancel_by_agent
+
+取消一个scope的缓冲提取工作。
 
 ## 三、它和谁协作
 
-- MemoryUpdater是它的下游。队列处理时调用更新器的update_memory方法。
-- MemoryMiddleware是它的上游。中间件把过滤后的对话加入队列。中间件在入队时捕获user_id。
-- 摘要压缩钩子通过add_nowait触发紧急刷新。紧急刷新带bypass_watermark标记。
-- DeerMemConfig提供防抖秒数和队列深度上限配置。
-- Gateway在停机时调用flush_sync做优雅排水。
+- MemoryUpdater做提取。
+- DeerMemConfig提供去抖和cap。
+- DeerMem的add调用它。
+- memory_flush_hook在摘要边界调用add_nowait。
 
 ## 四、重要性评级
 
-评级：8分。
+评级是8分。
 
-理由：这个类是记忆更新的调度中枢。没有这个队列，每轮对话都要付一次LLM提取的成本。这个类的防抖合并设计直接节省成本。这个类的并发设计很精细。设计包括锁顺序、重跑标记、在途线程join。这个类还处理了背压和优雅停机两个关键场景。队列是内存的，条目可能丢失，所以不是满分。
+理由如下。
+
+这个队列是内存提取的调度核心。
+
+去抖机制批量更新。
+
+backpressure丢非信号更新。信号和emergency总是准入。
+
+emergency flush的匹配键含bypass。
+
+不丢普通更新的未提取尾部。
+
+重调度的锁内原子性。
+
+flush_sync处理优雅关闭。
+
+judge参数在shutdown drain关闭。
+
+这些是内存可靠性核心。
+
+扣掉2分。
+
+扣分原因是它是队列机械件。

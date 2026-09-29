@@ -1,70 +1,136 @@
-# FileMemoryStorage档案
-
-源文件位置：backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/storage.py
+# FileMemoryStorage-档案
 
 ## 一、这个类是干什么的
 
-这个类是DeerMem记忆库的默认存储实现。
+FileMemoryStorage是agents/memory/backends/deermem/deermem/core/storage.py里的类。
 
-这个类继承自MemoryStorage抽象基类。这个类负责记忆的持久化落盘。
+它继承MemoryStorage。
 
-存储布局分两层。用户级摘要存在一个memory.json文件里。每条事实单独存在一个Markdown文件里。Markdown文件带YAML front matter。事实文件按智能体名字分目录。目录还按事实ID的sha256前缀分片。
+它是DeerMem的默认文件存储。
 
-这个类的职责包括几块。第一块是记忆的读写。第二块是事实的增删改查。第三块是版本迁移。第四块是检索适配。第五块是缓存管理。第六块是并发控制。
+按scope存内存。
 
-这个类的写入是安全的。写入使用用户锁、共享修订号、事实级修订号和恢复日志。写入是原子替换。POSIX文件系统下还会同步父目录。崩溃后恢复日志能把操作恢复回来。
+内存布局如下。
 
-## 二、类的成员
+每个scope是user_id加agent_name。
 
-### （一）字段
+全局memory.json是用户全局摘要。
 
-- _config：DeerMem私有配置。
-- _retrieval：可选的检索适配器。这个适配器实现了RetrievalPort协议。
-- _memory_cache：内存缓存。缓存按（user_id，agent_name）键存文档和签名。
-- _cache_lock：保护缓存的线程锁。
-- _scope_locks：用户范围的锁。这是一个弱引用字典。不活跃的用户范围不能留在缓存里。
-- _retrieval_dirty_scopes：检索索引脏标记集合。适配器更新失败时标记对应的范围。搜索先重建脏范围。
+agent facts在agents/{agent_name}/facts下。
 
-### （二）主要方法
+每个fact一个文件。
 
-- load：加载记忆文档。带缓存。加载前会完成日志恢复和迁移。签名匹配时直接返回缓存副本。
-- reload：强制重新加载记忆文档。不走缓存。可以选择重建检索索引。
-- save：兼容的全量替换接口。内部会diff成按事实的操作。提交时只写入新增、修改、删除的事实。
-- apply_changes：提交增量变更集。只返回应用的变化量。返回值的complete字段固定为False。这个方法支持清单修订冲突后的有限重定基。
-- upsert_fact：单条事实的新增或更新。底层走apply_changes。
-- delete_fact：单条事实的删除。底层走apply_changes。
-- get_fact：按ID读取一条事实。
-- list_facts：列出事实。支持过滤、游标和分页。
-- get_summaries：读取用户级摘要。
-- update_summaries：更新用户级摘要。摘要永远是用户全局的。摘要不会按智能体隔离。
-- migrate：对一个精确范围执行幂等的版本迁移。
-- clear_all：清空一个用户的摘要和所有智能体的事实桶。清空会保留智能体配置。
-- get_fact_usage：读取查询使用量侧车数据。这个数据用于容量打分。
-- record_fact_accesses：记录实际的查询命中。命中会递增访问热度。
-- record_capacity_eviction：持久化淘汰审计证据。审计只写元数据。
-- clear_fact_metadata：删除选中事实的侧车数据。也可以删除整个范围。
-- search_facts：搜索事实。配置了检索适配器时走适配器。脏范围先重建。重建失败时退回子串匹配。
-- _search_substring：子串匹配的兜底搜索。
-- rebuild_index：重建检索索引。支持全量重建和按范围重建。
-- retrieval_status：返回检索状态。
-- capabilities：返回存储能力集合。
-- close：释放检索适配器资源。
-- _commit_changes_locked：核心提交方法。只写入被寻址的事实文件加共享摘要JSON。提交前写恢复日志。提交后推进修订号。
-- _recover_if_needed：恢复或清理之前日志化的多文件操作。
-- _migrate_locked：合并旧版事实。合并不会覆盖已存在的规范事实。破坏性迁移前先备份源文件。
+带version驱动的幂等迁移。
+
+跨进程advisory文件锁。
+
+进程内scope缓存。
+
+这个类位于backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/storage.py。
+
+## 二、类的成员（字段、方法，各自做什么）
+
+### 1、load方法
+
+它加载一个scope的内存数据。
+
+迁移检测如下。
+
+journal文件存在或legacy路径存在或全局JSON需要迁移或previous_default_dir存在。
+
+需要迁移时scope锁加process文件锁下运行读迁移。
+
+迁移后dispatch检索通知。
+
+scope签名缓存。
+
+命中时返回deepcopy。
+
+### 2、reload方法
+
+reload强制重读。
+
+并重建检索索引。
+
+_rebuild_retrieval默认True。
+
+### 3、migrate方法
+
+它为一个精确scope运行幂等的version驱动迁移。
+
+### 4、缓存结构
+
+_memory_cache按scope作键。
+
+签名对照检测变化。
+
+deepcopy隔离调用方。
+
+_cache_lock保护。
+
+_scope_lock按scope串行。
+
+_process_file_lock是跨进程advisory锁。
+
+file_lock_timeout_seconds。
+
+### 5、保存
+
+save带expected_revision乐观并发。
+
+原子写。temp文件加replace。
+
+journal文件支持恢复。
+
+### 6、apply_changes
+
+apply_changes应用upserts、deletes、summaries变更集。
+
+fact revision和manifest revision乐观并发。
+
+### 7、检索同步
+
+upsert、remove、clear时发检索通知。
+
+_dispatch_retrieval_notifications同步检索索引。
+
+rebuild_index重建。
+
+### 8、markdown存储
+
+MarkdownMemoryStorage是markdown后端。
+
+容忍加载路径。
 
 ## 三、它和谁协作
 
-- MemoryStorage是它的父类。父类定义了存储协议。
-- MemoryUpdater是它的主要调用方。更新器通过注入拿到这个存储实例。
-- FTS5RetrievalAdapter是它的检索适配器。适配器实现RetrievalPort协议。存储层在释放持久锁之后才发送适配器更新。
-- create_storage工厂函数负责构造这个类。配置storage_class为file或缺省时返回这个类。
-- MarkdownMemoryStorage继承这个类。子类只重写摘要加载逻辑。
-- paths模块提供路径构建函数。
-- eviction模块提供淘汰决策类型。
+- MemoryStorage是基类契约。
+- MemoryUpdater通过它读写。
+- RetrievalPort连接检索模块。
+- scope锁和process文件锁。
 
 ## 四、重要性评级
 
-评级：9分。
+评级是7分。
 
-理由：这个类是记忆后端的核心存储类。所有记忆数据最终都落在这个类管理的磁盘文件上。这个类实现了完整的事务语义。事务语义包括恢复日志、双重修订号、原子替换、跨进程锁。这个类还负责版本迁移和检索集成。这个类出问题，整个记忆系统就会丢数据。这个类是全项目最关键的记忆组件之一。
+理由如下。
+
+FileMemoryStorage是DeerMem持久状态的实现。
+
+version驱动迁移。
+
+跨进程advisory锁。
+
+乐观并发。
+
+scope缓存deepcopy隔离。
+
+fact级存储。
+
+检索同步。
+
+这些是内存数据正确性的实现核心。
+
+扣掉3分。
+
+扣分原因是它是文件后端。实现层。

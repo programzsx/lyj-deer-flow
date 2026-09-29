@@ -1,67 +1,112 @@
-# McpTaskSubmitter档案
+# McpTaskSubmitter-档案
 
 ## 一、这个类是干什么的
 
-这个类是`deerflow.mcp.tasks.runtime`模块的协议类。
+McpTaskSubmitter不是类。
 
-这个类的作用是声明Gateway拥有的持久任务提交边界。
+McpTaskSubmitter是mcp/tasks/runtime.py里的Protocol。
 
-这个类是Protocol协议类。这个类只定义方法签名，不提供实现。
+runtime.py是Agent工具包装到Gateway任务服务的进程内桥。
 
-背景是这样的。
+McpTaskConfigurationError是配置的长驻MCP契约不能安全运行时抛出。
 
-DeerFlow支持长时运行MCP任务。
+长驻MCP任务的运行时配置和提交边界。
 
-Agent工具包装器负责提交持久任务。
+这个模块位于backend/packages/harness/deerflow/mcp/tasks/runtime.py。
 
-包装器不直接写数据库。包装器调用Gateway拥有的提交者。
+## 二、类的成员（字段、方法，各自做什么）
 
-提交者协议就是那个边界约定。
+### 1、McpTaskSubmitter Protocol
 
-模块docstring写的是"Process-local bridge from Agent tool wrappers to the Gateway task service"。意思是进程本地的桥，从Agent工具包装器连接到Gateway任务服务。这个类是这个桥的协议面。
+submit提交任务。
 
-mcp的AGENTS.md说明了运行时可用性边界。文档写的是"the installed process-local submitter is the source of truth for durable task-management tool exposure"。意思是安装的进程本地提交者是持久任务管理工具暴露的事实来源。`is_mcp_task_runtime_available`检查提交者是否已安装。已安装才暴露管理工具。
+list_tasks列任务。按线程。
 
-Gateway启动时通过`set_mcp_task_submitter`安装真正的实现。实现是`McpTaskService`。
+cancel_matching_task取消匹配任务。
 
-## 二、类的成员
+### 2、McpTaskDriver Protocol
 
-这个类声明三个方法。
+driver.py里。
 
-- `submit`：异步方法。关键字参数有`driver_name`、`request`、`now`。`request`是`TaskSubmitRequest`。`now`是可选的时间参数。输出是字典。这个方法提交一个持久任务。调用方传入驱动名和协议中立的请求。返回字典携带本地任务ID等信息。
-- `list_tasks`：异步方法。关键字参数有`thread_id`、`user_id`、`thread_incarnation`、`limit`、`active_only`。输出是字典列表。这个方法列出线程的任务。`limit`默认50。`active_only`默认`False`，为`True`时只列活跃任务。
-- `cancel_matching_task`：异步方法。关键字参数有`thread_id`、`user_id`、`thread_incarnation`、`task`。输出是字典。这个方法取消匹配的任务。`task`参数可以是任务名或本地任务ID。
+submit返回TaskSubmission。
 
-三个方法的输入都带作用域三元组。三元组是线程ID、用户ID、线程化身。这保证查询和取消只在正确的范围内匹配。
+get_status返回TaskSnapshot。
+
+cancel返回TaskSnapshot。
+
+传输和协议adapter。协议中立任务runtime用它。
+
+### 3、McpTaskDriverRegistry
+
+进程内driver目录。Gateway启动时接线。
+
+register注册。名字非空。重复抛错。
+
+get取driver。names返回排序名字。
+
+### 4、配置快照
+
+_task_server_configs构建任务启用的服务器配置。
+
+task_toolsets非空的启用服务器。
+
+set_mcp_task_config_snapshot冻结一个Gateway进程生命周期的设置。
+
+validate_mcp_task_config_snapshot拒绝拆分工具发现和后台调用的热变更。
+
+改变后重启DeerFlow才能用持久任务工具。
+
+### 5、submitter边界
+
+set_mcp_task_submitter安装或清除Gateway拥有的提交边界。
+
+is_mcp_task_runtime_available判断是否安装。
+
+get_mcp_task_submitter取边界。
+
+未初始化时抛McpTaskConfigurationError。
+
+要求mcp_tasks.enabled为true和SQL数据库后端。
+
+### 6、fail startup
+
+validate_mcp_task_runtime_configuration在启动时fail。
+
+task_toolsets配置但mcp_tasks.enabled为false时抛错。
+
+不静默把这些工具暴露成同步调用。
+
+SQL持久化缺失时抛错。
+
+memory后端重启后不能恢复任务。
+
+build_server_params失败时转成McpTaskConfigurationError。
 
 ## 三、它和谁协作
 
-这个类和以下对象协作。
-
-- `McpTaskService`：这个协议的真实实现。Gateway启动时安装。
-- `set_mcp_task_submitter`：模块级函数。这个函数安装或清除提交者。
-- `get_mcp_task_submitter`：模块级函数。这个函数返回提交者。未安装时抛出`McpTaskConfigurationError`。
-- `is_mcp_task_runtime_available`：模块级函数。这个函数检查提交者是否已安装。
-- `McpTaskConfigurationError`：未安装时的异常信号。
-- Agent工具包装器：上游调用方。包装器通过这个协议提交任务。
-- `TaskSubmitRequest`：提交请求的数据类。
+- McpTaskService实现submitter协议。
+- McpTaskDriver和OrdinaryMcpTaskDriver是传输adapter。
+- MCP工具包装调用get_mcp_task_submitter。
+- ExtensionsConfig提供服务器配置。
 
 ## 四、重要性评级
 
-评级：7分。
+评级是7分。
 
 理由如下。
 
-这个类是Agent工具层和Gateway任务服务之间的桥接协议。没有这个约定，工具包装器就要直接依赖`McpTaskService`。harness层就要依赖app层。这违反了harness和app的分层边界。
+这个模块是长驻MCP任务的运行时边界。
 
-这个类还是运行时可用性的事实来源。`is_mcp_task_runtime_available`靠提交者是否安装来决定管理工具是否暴露。
+配置快照防止热变更拆分工具发现和后台调用。
 
-这个类让工具层可测试。测试可以传入假的提交者。
+fail startup防止静默回退到同步调用。
 
-依赖方明确。工具包装器依赖这个协议。Gateway提供实现。
+submitter边界把工具包装接到Gateway服务。
 
-如果删掉这个类，harness层的任务工具就要硬编码对实现类的依赖。分层边界被破坏。
+driver注册表进程内接线。
 
-但是这个类没有任何实现。这个类只是签名。
+这些是持久任务安全的关键。
 
-所以这个类给7分。这个类是分层边界上的关键协议。
+扣掉3分。
+
+扣分原因是它是桥和协议层。

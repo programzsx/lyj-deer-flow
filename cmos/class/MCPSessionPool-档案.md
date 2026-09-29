@@ -1,103 +1,151 @@
-# MCPSessionPool档案
+# MCPSessionPool-档案
 
 ## 一、这个类是干什么的
 
-这个类是`deerflow.mcp.session_pool`模块的核心类。
+MCPSessionPool是mcp/session_pool.py里的类。
 
-这个类的作用是管理持久的MCP会话。
+它是持久MCP会话池。支撑有状态工具调用。
 
-类文档写的是"Manages persistent MCP sessions scoped by ``(server_name, scope_key, owning_loop)``"。意思是按服务器名、隔离键、持有事件循环三元组管理持久MCP会话。
+langchain-mcp-adapters用session=None加载MCP工具时。
 
-背景是这样的。
+每次工具调用创建新MCP会话。
 
-MCP工具通过langchain-mcp-adapters加载。
+对有状态服务器如Playwright。
 
-如果每次工具调用都新建一个MCP会话，服务器端的状态会丢失。
+浏览器状态、打开的页面、填的表单在调用间丢失。
 
-例如Playwright这样的有状态服务器。打开的页面、填过的表单都会丢。
+这个模块提供会话池。
 
-会话池解决这个问题。同一个循环上的连续调用共享同一个会话。服务器端状态得以保留。
+维护持久MCP会话。
 
-会话按三元组隔离。三元组是服务器名、隔离键（通常是thread_id）、持有循环。独立循环使用独立会话。
+按(server_name, scope_key, owning_loop)作用域。
 
-会话池有容量上限。达到上限后按LRU顺序驱逐会话。
+同一loop上的连续调用共享server端状态。
 
-模块docstring详细说明了这个模块的背景。模块写的是"Persistent MCP session pool for stateful tool calls"。
+独立loop用独立会话。
 
-这个类的使用场景是stdio传输的MCP服务器调用。Agent的普通工具调用和持久任务调用都通过会话池拿会话。
+sync wrapper每次调用用新loop。
 
-## 二、类的成员
+不保留状态。
 
-### 1、类常量
+池达容量时LRU淘汰。
 
-- `MAX_SESSIONS`：256。这是活跃会话的硬上限。源码注释说明容量在两个时点强制执行。第一个时点是创建会话之前。第二个时点是进行中的会话被提交进池的时候。原因是不同键可能并发完成初始化，它们都观察到有空余容量。
-- `SESSION_CLOSE_TIMEOUT`：5.0秒。这是在外部循环上关闭会话时的等待时长。
+生命周期模型如下。
 
-### 2、核心方法
+MCP ClientSession实现在anyio task group上。
 
-- `get_session`：输入是服务器名、隔离键、连接配置。输出是初始化好的`ClientSession`。这是最复杂的方法。流程分四个阶段。第一阶段在锁内检查注册表，决定三种结果之一。三种结果是返回已有会话、加入进行中的创建、成为这个键的创建者。达到容量就驱逐LRU条目。第二阶段关闭被驱逐的会话。先给所有被驱逐的持有者发信号，再等待同循环的关闭完成。第二阶段b，加入进行中的创建，共享结果。第三阶段等待自己的持有者任务提交初始化好的会话。第四阶段返回会话。
-- `close_scope`：输入是隔离键。关闭这个隔离键的所有会话。
-- `close_session`：输入是服务器名和隔离键。跨所有持有循环关闭这两者的会话。
-- `close_session_if_current`：输入是服务器名、隔离键、会话对象。只有当这个会话仍然是注册条目时才关闭。这个方法被`call_pooled_session_tool`在断连时调用。
-- `close_server`：输入是服务器名。关闭这个服务器的所有会话。
-- `close_all`：关闭全部托管会话。
-- `close_all_sync`：同步版本。在各自的持有循环上关闭所有会话。可以从任何线程调用。文档说明了不同位置的关闭语义差异。当前线程正在运行的循环只能发信号，不能阻塞等待。
+anyio强制cancel scope必须从进入它的同一task退出。
 
-### 3、会话持有者任务
+从其他task调cm.__aexit__抛RuntimeError。
 
-模块docstring的"Lifecycle model (owner task)"章节解释了核心设计。
+sync-tool路径每次调用通过fresh asyncio.run驱动。
 
-MCP的`ClientSession`建立在anyio任务组之上。anyio要求取消作用域必须由进入它的同一个任务退出。从别的任务调用`__aexit__`会报错。
+一个调用中进入的会话会在另一个调用中退出。
 
-同步工具路径用新的`asyncio.run`事件循环驱动每次调用。一个调用里进入的会话会在另一个调用里退出，跨任务崩溃。
+从不同task。然后崩。GitHub issue #3379。
 
-解决方案是每个池化会话由一个专门的`_run_session`任务持有。这个任务进入上下文管理器，把活会话交回给调用方，然后等待关闭事件。所有关闭路径只发信号。持有者任务自己执行`__aexit__`。保证进入和退出总在同一个任务。
+为了让这不可能。
 
-`_run_session`的关键点。初始化成功后有提交点。提交点在锁内的同一个原子临界区里完成两件事。第一件是把进行中记录提升进`_entries`。第二件是用会话解决`ready` future。这保证调用方只能拿到池已经持有的会话。
+每个池化会话由专用_run_session task拥有。
 
-### 4、清理辅助方法
+那个task进入context manager。
 
-- `_signal_close`：给持有者任务发关闭信号。`asyncio.Event.set`不是线程安全的，所以调度到持有循环上执行。
-- `_shutdown`：发信号并等待持有者任务完成。`cancel=True`用于进行中的创建，因为持有者可能阻塞在`initialize()`里，关闭事件唤不醒它。等待被shield保护，取消当前等待不会取消持有者。
-- `_shutdown_entry`：关闭一个条目，把关闭动作路由到持有循环。
-- `_close_owners`：关闭已经移除的持有者。先给全部发信号，再逐个等待。这保证关闭调用被取消时不会困住已脱离注册表的持有者。
-- `_cancel_owner`：线程安全的受保护取消。失败状态复查在持有循环的回调内部执行，避免先检查后取消的时间窗口。
-- `_track_owner_teardown`：保留被分离的清理任务。事件循环只保留任务的弱引用。不被持有的清理任务可能被垃圾回收，导致清理半途而废。
-- `_creation_committed`：判断创建是否已提交。已提交的会话是池的财产，回退路径不能把它拆掉。
-- `_owner_unwinding_after_failure`：判断持有者是否已失败并在执行退出。这种持有者不能被取消。
-- `_discard_owner`：只退役指定的持有者。
+把活会话交回调用者。
 
-### 5、模块级单例
+然后在close事件上等待。
 
-模块还提供两个单例函数。
+所有shutdown路径只signal那个事件。
 
-- `get_session_pool`：返回全局会话池单例。构造和返回都在锁内完成。
-- `reset_session_pool`：重置单例并返回退役的池。
+owner task自己执行__aexit__。
+
+保证enter和exit总在同一task。
+
+owner task也是把创建提升进池的唯一写者。
+
+initialize成功后在_entries注册会话。
+
+在一个原子临界区里resolve创建的future。
+
+调用者只能收到池已拥有的会话。
+
+永不收到生命周期还绑在单个可能被取消的调用者上的会话。
+
+这个类位于backend/packages/harness/deerflow/mcp/session_pool.py。
+
+## 二、类的成员（字段、方法，各自做什么）
+
+### 1、会话作用域
+
+按(server_name, scope_key, owning_loop)作用域。
+
+scope_key来自mcp_session_scope_key。
+
+user_id、thread_id、thread_incarnation。
+
+### 2、owner task生命周期
+
+_run_session task拥有会话。
+
+enter context manager。交回会话。等close事件。
+
+shutdown只signal事件。
+
+owner执行__aexit__。
+
+enter和exit总在同一task。
+
+owner是创建提升进池的唯一写者。
+
+initialize成功后原子注册。
+
+### 3、call_pooled_session_tool
+
+它通过池调用工具。
+
+持久会话的工具调用。
+
+### 4、错误处理
+
+_MCP_CLOSED_STREAM_ERRORS包括ClosedResourceError、BrokenResourceError、EndOfStream。
+
+_is_mcp_transport_disconnect判断传输断连。
+
+断连的会话被驱逐。
+
+_finish_session_cleanup清理。
+
+### 5、单例
+
+get_session_pool返回全局池。
+
+reset_session_pool重置。
 
 ## 三、它和谁协作
 
-这个类和以下对象协作。
-
-- `call_pooled_session_tool`：模块级函数。这个函数调用池化会话并在显式断连时驱逐会话。
-- `langchain_mcp_adapters.sessions.create_session`：会话工厂。`_run_session`用它创建会话。
-- `McpTaskToolCaller`：stdio传输的任务调用方。这个类通过`get_session`拿会话。
-- mcp工具调用链路：Agent的普通工具调用也通过会话池。
-- anyio和mcp库：`ClientSession`的底层实现。
+- McpTaskToolCaller通过池调用持久会话工具。
+- langchain_mcp_adapters的会话。
+- task_tool的代理。GitHub issue #3379。
 
 ## 四、重要性评级
 
-评级：9分。
+评级是8分。
 
 理由如下。
 
-这个类是所有有状态stdio MCP服务器的基础设施。没有这个类，Playwright等有状态服务器的每次调用都丢失服务器端状态。功能基本不可用。
+这个类是有状态MCP工具的会话池核心。
 
-这个类解决了真实的崩溃问题。GitHub issue #3379记录了跨任务退出取消作用域的崩溃。会话持有者模型把这个崩溃变成不可能。
+owner task生命周期模型解决anyio cancel scope的同task约束。
 
-这个类的并发设计覆盖了大量边界情况。并发创建共享、LRU驱逐、跨循环关闭、取消安全、垃圾回收保护。这些设计保护了网关的稳定性。
+GitHub issue #3379的崩溃防护。
 
-依赖方多。Agent工具调用、持久任务调用都经过这个类。如果删掉这个类，全部stdio MCP功能退化为无状态调用。
+owner是创建提升的唯一写者。原子临界区。
 
-不给满分的原因是。这个类只服务stdio传输。HTTP和SSE传输的会话是临时的，不走这个类。
+LRU淘汰。
 
-所以这个类给9分。
+作用域按server加scope_key加loop。
+
+这些是有状态工具调用正确性的核心。
+
+扣掉2分。
+
+扣分原因是它是会话机械件。

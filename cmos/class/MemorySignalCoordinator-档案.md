@@ -1,103 +1,191 @@
-# MemorySignalCoordinator档案
+# MemorySignalCoordinator-档案
 
 ## 一、这个类是干什么的
 
-这个类是内存层的判官。
+MemorySignalCoordinator是agents/memory/signals/coordinator.py里的类。
 
-这个类的作用是对一批对话做预筛选和信号分类。
+它用启用的侧评判一批文本。
 
-这个类回答的问题是"这一批对话值得花模型的钱去提取记忆吗，模型对这批对话有什么提示"。
+允许时组合它们的请求。
+
+它是内存judging的协调者。
+
+管理预筛选和信号分类两侧。
+
+组合策略是combine。
+
+支持auto、never、always。
 
 这个类位于backend/packages/harness/deerflow/agents/memory/signals/coordinator.py。
 
-源文件的模块说明说，这是DeerMem更新器调用的唯一对象。这个类存在的理由是"唯一权威"原则。两个侧不能各自组装请求。组装请求的权力集中在这个类手里。
-
-这个类管理两个侧。一个侧是预筛选器。预筛选器决定抽取调用值不值得花钱。另一个侧是信号分类器。分类器判断文本是否认可或拒绝用户之前的偏好。
-
-这个类的判断流程分三个阶段。
-
-第一阶段是资格判断。每一侧独立决定自己能不能判断这一轮。预筛选器有自己独有的放弃理由。比如确定性信号已存在。比如过期审查开着。两个侧共同的放弃理由有关机排水和紧急刷写。
-
-第二阶段是缓存和组装。协调器先查缓存。查完缓存再算还缺哪些问题。然后按合并策略组装请求。合并策略有三种。`always`是永远合并成一次请求。`never`是每侧各发一次。`auto`是配置匹配才合并。缓存全命中时，什么都不发。
-
-第三阶段是消费。模式决定结果意味着什么。预筛选的`shadow`模式只记录。预筛选的`enforce`模式会跳过抽取。分类器的`shadow`模式只记录。分类器的`hints`模式会把标签合并进提示。唯一的例外是否决机制。预筛选`enforce`乘分类器`hints`乘高概率信号，能救回一个本要跳过的批次。
-
-失败处理是加法式的。一个侧没有结果，另一个侧的结果照样有效。调用方退回确定性行为。判官永远不抛请求级异常。
-
 ## 二、类的成员（字段、方法，各自做什么）
 
-这个类管理两个侧的提供方、两个模式、一个合并策略和一个缓存。
+### 1、MemoryBatchContext和MemoryBatchVerdict
 
-### 1、构造方法
+MemoryBatchContext是updater调用judge时对一批的了解。
 
-- `__init__`方法：输入是关键字参数。`prescreen`是预筛选提供方。`prescreen_mode`是预筛选模式。`classifier`是分类提供方。`classifier_mode`是分类模式。`combine`是合并策略。构造时做三件事。第一，校验`combine`的合法性，非法值直接抛ValueError。第二，存下所有配置。第三，计算`_combined`标志。`combine`为`always`但两个侧配置不匹配时，构造直接失败。配置匹配时，建一个AnswerCache。
+batch_text、digest、signals、staleness开关、bypass_watermark等。
 
-### 2、构造辅助方法
+MemoryBatchVerdict是updater应对这批做什么。加审计payload。
 
-- `_both_combinable`方法：无输入。返回布尔值。判断两个侧是否都符合可合并协议，且`combine`不是`never`。
-- `_cache_size`方法：无输入。返回整数。取两个侧缓存容量的最大值。
-- `_cache_ttl`方法：无输入。返回浮点数。取两个侧缓存有效期的最小值。
-- `_sharing_key`方法：输入是一个侧对象。返回字符串。取这一侧的共享身份，包括传输层看不到的维度。
-- `_configuration_matches`方法：无输入。返回布尔值。比较两个侧的共享身份是否一致。
+skip已经是生效的决策。
 
-### 3、判官入口
+被否决的skip以skip为False加vetoed_by_model_signal为True到达。
 
-- `__call__`方法：输入是普通映射。返回MemoryBatchVerdict。这是钩子入口。DeerMem送来普通映射，不送宿主类型。这个方法把映射适配成MemoryBatchContext。调用方不给`digest`时，这个方法现场算一个。
-- `judge`方法：输入是MemoryBatchContext。返回MemoryBatchVerdict。这是判官主逻辑。这个方法对请求级失败永远不抛异常。先算两个侧的资格。合并可用且有侧有资格时，走合并路径。否则走单侧路径。最后交给`_consume`。
+hints是模型的提示标签。
 
-### 4、单侧判断方法
+### 2、Combinable协议
 
-- `_decide_prescreen`方法：输入是上下文。返回_SideOutcome。这一侧自己发请求。捕到TypeSafeError就记为请求失败。
-- `_decide_classifier`方法：逻辑同上，服务于分类器侧。
+CombinablePrescreen和CombinableClassifier是能共享请求的侧。
 
-### 5、合并判断方法
+暴露questions、ask、interpret、sharing_key。
 
-- `_judge_combined`方法：输入是上下文和两个资格。返回两个_SideOutcome的元组。这是合并路径的核心。先拼出完整逻辑问题集。再按资格拼出本轮想要的问题。再查缓存。缓存键由共享身份、完整逻辑问题集和摘要组成。缓存里的答案直接复用。缺的问题让有资格的一侧去发请求。请求失败时，有资格的侧一起记失败。请求成功时，答案写回缓存。最后让每一侧解释自己关心的答案。
-- `_interpret_side`静态方法：输入是一个侧、答案映射、本轮拉取的问题集合、拉取时的模型、缓存桶。返回决定或None。这个方法按逐答案的来源判断这一侧是缓存命中还是网络采样。这一侧的问题里有任何一个本轮拉取过，这一侧就算网络采样。
+### 3、构造和组合
 
-### 6、资格方法
+combine必须在COMBINES里。
 
-- `_prescreen_eligibility`方法：输入是上下文和批次长度。返回_Eligibility。按固定顺序检查禁用、关机排水、紧急刷写、确定性信号、维护开关、长度上限。
-- `_classifier_eligibility`方法：逻辑同上，但检查项少一些。
-- `_over_limit`静态方法：输入是一个侧对象和批次长度。返回布尔值。这一侧的`max_state_chars`是字符数。字符数故意不用字节数。字节数会让CJK文本过早触发回退。
+combined在combine非never、两侧都可组合、配置匹配时为True。
 
-### 7、消费方法
+combine为always但配置不匹配时抛ValueError。
 
-- `_consume`方法：输入是上下文、两个资格、两个结果、耗时。返回MemoryBatchVerdict。两个侧开启时，写两个审计载荷。然后算skip。skip生效需要四个条件同时成立。预筛选器存在。预筛选模式是`enforce`。决定是跳过。预筛选有资格。再取hints。分类器有资格、模式是`hints`、有决定时，取标签。skip成立且hints非空时，否决发生。skip变回False，否决标志置True。
+要求两侧共享每个生效的客户端设置。
 
-- `_prescreen_payload`方法：输入是上下文、资格、结果、耗时。返回字典或None。装预筛选侧的审计记录。记录里有模式、结论、概率、模型、缓存标志、摘要、信号、耗时和回退原因。
-- `_classifier_payload`方法：逻辑同上，装分类器侧的审计记录。确定性信号集写进两侧的记录。两个通道保持分开可审计。
+模型、base_url、凭证指纹、超时、重试、transport、缓存设置。
 
-### 8、身份方法
+组合时共享一个AnswerCache。
 
-- `release_policy_parameters`方法：无输入。返回字典。声明两个侧的策略身份和合并策略。凭据永远不进这个字典。
+cache_size取两侧最大。cache_ttl取两侧最小。
+
+### 4、judge方法
+
+judge评判一批。请求级失败永不抛。锁定S2和L2。
+
+不合格的侧是fallback。不是沉默。
+
+任何侧启用时round仍发它的记录带fallback reason。
+
+为什么这批没被评判保持可审计。
+
+只有每侧都关的round才产生空payload。
+
+### 5、资格判断
+
+_prescreen_eligibility按顺序检查。
+
+禁用、drain、emergency bypass、确定性信号、维护审查、超限。
+
+信号存在时禁用预筛选。
+
+确定性正证据优先于模型负verdict。这是L3。
+
+维护审查启用时禁用。
+
+skip也会跳过那批的维护审查。这是L8。
+
+_over_limit用字符数。
+
+不是字节数。
+
+数字节会在CJK文本上提前三次触发回退。
+
+### 6、_judge_combined方法
+
+一个共享部署的请求装配。
+
+缓存优先。然后缺失的问题。
+
+桶按完整逻辑问题集作键。
+
+独立于本轮发送什么。
+
+不合格的侧不花重复请求。
+
+它持有的答案仍能找到。
+
+它的问题不进wanted。
+
+cache_key是共享键、逻辑集、digest三元组。
+
+按答案的模型来源。
+
+合并后续部分响应不会把已持有的答案重新归属到新模型。
+
+missing问题通过网络问。
+
+任一client都能携带请求。
+
+组合部署保证每个生效设置匹配。
+
+整个请求失败时什么都不写。
+
+不合格侧保留自己的reason。
+
+cached标志只在这侧没消费网络答案时为True。
+
+shadow评估的网络样本数追踪它实际用的答案。
+
+### 7、_consume方法
+
+skip条件是预筛选合格、verdict为skip、mode为enforce。
+
+hints在classifier合格且mode为hints时取labels。
+
+skip和hints同时存在时skip被否决。
+
+这是模型verdict改变提取决策的唯一方式。
+
+### 8、审计payload
+
+_prescreen_payload和_classifier_payload记录完整审计。
+
+mode、verdict、probability、threshold、model、cached、digest、signals、时长、fallback_reason。
+
+确定性集合记录在两侧的记录上。
+
+两个通道保持分别可审计。即使只有一侧开。
+
+### 9、build_memory_judge
+
+从宿主内存配置构建judge。
+
+每侧都关时返回None。
+
+调用方把结果注入后端作judge宿主钩子。
+
+None表示没配置judging。
+
+提取路径和没有这个功能的部署字节相同。
 
 ## 三、它和谁协作
 
-这个类是整个judging体系的枢纽。
-
-上游调用方。DeerMem更新器通过judge钩子调用这个类。`build_memory_judge`函数负责构造这个类。构造的输入是宿主内存配置。两侧都关闭时，`build_memory_judge`返回None。
-
-下游依赖。这个类依赖prescreen包的契约和提供方。依赖signals/contract.py的契约和提供方。依赖judging模块的AnswerCache、CachedVerdict、batch_chars、batch_digest。依赖typesafe包的Answer、AnswerSet、Question、TypeSafeError。
-
-组合关系。这个类内部持有预筛选提供方和分类提供方。两个提供方符合CombinablePrescreen和CombinableClassifier协议时，走合并路径。
-
-内部辅助。这个类使用_Eligibility和_SideOutcome两个内部数据类。使用`_request_failure`、`_fallback_reason`、`_optional_str`、`_prescreen_request`、`_signal_request`几个模块级函数。
-
-配置热重载。设计文档说，judging配置改动会热重载到缓存的管理器上。`get_memory_manager`通过`MemoryManager.refresh_judge`重建并注入这个类。
+- TypeSafeMemoryPrescreen是预筛选侧。
+- signals/typesafe.py的classifier是分类侧。
+- AnswerCache是共享缓存。
+- DeerMem updater通过judge钩子调用。
+- build_memory_judge是工厂。
 
 ## 四、重要性评级
 
-这个类的评级是9分。
+评级是7分。
 
 理由如下。
 
-这个类是内存judging体系的唯一权威。预筛选和信号分类的请求组装、缓存、资格、消费全部集中在这里。设计文档说这是"更新器调用的唯一对象"。唯一权威原则就是靠这个类实现的。
+这个协调者是内存judging的核心。
 
-这个类承载了大量设计不变量。缓存先于资格收窄。完整逻辑问题集做缓存键。部分答案不算命中。逐答案的模型来源。开启的侧永远留记录。请求失败和无结论分开。这些不变量全部实现在这个类里。
+组合请求让两侧共享一次网络调用。
 
-这个类错了，后果很直接。skip逻辑错了，记忆会被错误跳过。缓存键错了，会出现重复请求或错误归属。否决逻辑错了，救回机制失效。
+缓存按逻辑问题集作键。
 
-删掉这个类，整个预筛选和信号分类体系失去中枢。更新器没有judging可用。判定行为退回到纯确定性规则。
+不合格侧不花重复请求。
 
-这个类依赖面广，但对外接口收敛。外部只需要`__call__`和`build_memory_judge`。评级给9分，不给满分是因为这个类本身是可选特性。两侧都关闭时，这个类根本不会被构造。
+skip否决语义清晰。是模型verdict影响决策的唯一通道。
+
+审计payload完整。两侧分别可审计。
+
+确定性证据优先于模型verdict。
+
+这些设计质量很高。
+
+扣掉3分。
+
+扣分原因是它是可选成本优化协调层。
