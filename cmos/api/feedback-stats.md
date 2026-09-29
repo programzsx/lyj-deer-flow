@@ -1,0 +1,107 @@
+# 运行反馈统计接口
+
+## 接口地址
+
+请求方法是`GET`。
+
+完整路径是`/api/threads/{thread_id}/runs/{run_id}/feedback/stats`。
+
+网关端口是8001。
+
+完整地址示例是`http://localhost:8001/api/threads/th_abc/runs/run_123/feedback/stats`。
+
+路径参数说明如下。
+
+- `thread_id`：会话ID。字符串类型。表示运行所在的会话。
+- `run_id`：运行ID。字符串类型。表示要查询反馈统计的运行。
+
+## 接口鉴权
+
+认证方式有两种。
+
+第一种是session cookie认证。
+
+浏览器先登录。登录接口是`POST /api/v1/auth/login/local`。
+
+登录成功后，网关下发HttpOnly的`access_token`cookie。
+
+后续请求携带该cookie。
+
+第二种是PAT认证。
+
+PAT是个人访问令牌。令牌以`dfp_`开头。
+
+请求时放在`Authorization`头部。格式是`Bearer <token>`。
+
+token来源说明如下。
+
+session cookie的token来自登录接口。
+
+PAT的token来自用户在令牌管理接口创建的令牌。
+
+权限说明如下。
+
+源码使用装饰器`@require_permission("threads", "read", owner_check=True)`。
+
+调用者需要`threads:read`权限。
+
+`owner_check=True`表示网关会校验调用者是否拥有该会话。
+
+调用者不拥有该会话时返回404。
+
+session用户的权限来自授权配置。授权关闭时，session用户拥有全部权限。
+
+PAT调用者需要令牌作用域包含`threads:read`。
+
+该路由在PAT路由白名单内。PAT以令牌所属用户的身份执行。
+
+## 请求入参
+
+路径参数说明如下。
+
+- `thread_id`：会话ID。字符串类型。表示运行所在的会话。
+- `run_id`：运行ID。字符串类型。表示要查询反馈统计的运行。
+
+本接口没有请求体。
+
+本接口没有查询参数。
+
+请求示例见curl命令一节。
+
+## 响应出参
+
+成功返回HTTP 200。
+
+本接口返回该运行的聚合反馈统计。
+
+响应字段说明如下。
+
+- `run_id`：运行ID。字符串类型。
+- `total`：反馈总数。整数类型。默认值是0。
+- `positive`：好评数量。整数类型。默认值是0。
+- `negative`：差评数量。整数类型。默认值是0。
+
+响应示例来自源码响应模型推导。
+
+```json
+{
+  "run_id": "run_123",
+  "total": 2,
+  "positive": 1,
+  "negative": 1
+}
+```
+
+## curl命令
+
+```bash
+curl -s http://localhost:8001/api/threads/th_abc/runs/run_123/feedback/stats \
+  -H "Authorization: Bearer <token>"
+```
+
+session cookie方式的curl命令如下。
+
+```bash
+curl -s http://localhost:8001/api/threads/th_abc/runs/run_123/feedback/stats \
+  -H "Cookie: access_token=<token>"
+```

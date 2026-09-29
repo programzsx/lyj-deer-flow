@@ -1,0 +1,71 @@
+# 查询子智能体批次详情接口
+
+## 接口地址
+
+- 请求方法是GET。
+- 完整路径是`/api/threads/{thread_id}/subagent-batches/{batch_id}`。
+- 网关端口是8001。
+- 完整URL示例是`http://localhost:8001/api/threads/thread-xyz/subagent-batches/batch-001`。
+- 路径参数`thread_id`是会话线程的ID。
+- 路径参数`batch_id`是子智能体批次的ID。
+
+## 接口鉴权
+
+- 本接口使用session cookie认证。
+- cookie名称是`access_token`。
+- cookie由`POST /api/v1/auth/login/local`登录接口创建。
+- 源码权限装饰器是`@require_permission("threads", "read", owner_check=True)`。
+- 调用者需要`threads:read`权限。
+- 权限校验带所有者检查。调用者必须是该线程的所有者。
+- 未登录时返回401。
+- 批次不存在、不属于当前用户或线程ID不匹配时返回404。
+- PAT Bearer调用会返回403。PAT允许清单不包含本接口。
+
+## 请求入参
+
+- 本接口没有请求体。
+- 本接口没有查询参数。
+- 路径参数`thread_id`是线程ID。
+- 路径参数`batch_id`是批次ID。
+- 两个路径参数必须匹配同一条批次记录。否则返回404。
+
+## 响应出参
+
+- 响应是单个批次对象。
+- 字段与批次列表接口的元素结构一致。
+- 响应示例来自源码响应模型推导。
+
+响应示例：
+
+```json
+{
+  "id": "batch-001",
+  "thread_id": "thread-xyz",
+  "title": "批量文档分析",
+  "subagent_type": "general-purpose",
+  "status": "running",
+  "total_items": 10,
+  "max_live_items": 4,
+  "max_running_items": 4,
+  "max_attempts": 3,
+  "created_at": "2026-09-29T08:00:00+00:00",
+  "updated_at": "2026-09-29T08:05:00+00:00",
+  "completed_at": null,
+  "counts": {
+    "pending": 2,
+    "queued": 1,
+    "leased": 0,
+    "running": 4,
+    "succeeded": 3,
+    "failed": 0,
+    "cancelled": 0
+  }
+}
+```
+
+## curl命令
+
+```bash
+curl -X GET "http://localhost:8001/api/threads/thread-xyz/subagent-batches/batch-001" \
+  -b "access_token=<token>"
+```
